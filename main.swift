@@ -73,30 +73,31 @@ let kMyProductID =		8193
 
 struct MyPrivateData {
     var notification: io_object_t = 0
-    var deviceInterface: UnsafeMutablePointer<UnsafeMutablePointer<IOUSBDeviceInterface>> = nil
+    var deviceInterface: UnsafeMutablePointer<UnsafeMutablePointer<IOUSBDeviceInterface>>? = nil
     var deviceName: String?
     var locationID: UInt32 = 0
 }
 
-extension UnsafeMutablePointer: OutputStreamType {
-    public func write(string: String) {
-        if Memory.self is FILE.Type {
-            let filePtr = UnsafeMutablePointer<FILE>(self)
-            fputs(string, filePtr)
+extension UnsafeMutablePointer: TextOutputStream {
+    public func write(_ string: String) {
+        if Pointee.self is FILE.Type {
+            self.withMemoryRebound(to: FILE.self, capacity: 1) {filePtr in
+                _ = fputs(string, filePtr)
+            }
         }
     }
 }
 
 //from mach/error.h
-func err_system(x: UInt32)->UInt32 {return (((x)&0x3f)<<26)}
-func err_sub(x: UInt32)->UInt32 {return (((x)&0xfff)<<14)}
+func err_system(_ x: UInt32)->UInt32 {return (((x)&0x3f)<<26)}
+func err_sub(_ x: UInt32)->UInt32 {return (((x)&0xfff)<<14)}
 
 //from IOReturn.h
 let sys_iokit =                       err_system(0x38)
 let sub_iokit_common =                err_sub(0)
 
 //from IOMessage.h
-func iokit_common_msg(message: UInt32)->UInt32 {return (sys_iokit|sub_iokit_common|message)}
+func iokit_common_msg(_ message: UInt32)->UInt32 {return (sys_iokit|sub_iokit_common|message)}
 
 let kIOMessageServiceIsTerminated      = iokit_common_msg(0x010)
 let kIOMessageServiceIsSuspended       = iokit_common_msg(0x020)
@@ -131,7 +132,7 @@ let kIOCFPlugInInterfaceID = CFUUIDGetConstantUUIDWithBytes(nil,
     0x91, 0xD4, 0x00, 0x50, 0xE4, 0xC6, 0x42, 0x6F)
 
 
-private var gNotifyPort: IONotificationPortRef = nil
+private var gNotifyPort: IONotificationPortRef? = nil
 private var gAddedIter: io_iterator_t = 0
 private var gRunLoop: CFRunLoop?
 
@@ -144,26 +145,27 @@ private var gRunLoop: CFRunLoop?
 //	messages are defined in IOMessage.h.
 //
 //================================================================================================
-func DeviceNotification(refCon: UnsafeMutablePointer<Void>, service: io_service_t, messageType: natural_t, messageArgument: UnsafeMutablePointer<Void>) {
-    let privateDataRef = UnsafeMutablePointer<MyPrivateData>(refCon)
+func DeviceNotification(_ refCon: UnsafeMutableRawPointer?, service: io_service_t, messageType: natural_t, messageArgument: UnsafeMutableRawPointer?) {
+    let privateDataRef = refCon!.assumingMemoryBound(to: MyPrivateData.self)
     
     if messageType == kIOMessageServiceIsTerminated {
-        print("Device removed.", toStream: &stderr)
+        print("Device removed.", to: &stderr)
         
         // Dump our private data to stderr just to see what it looks like.
-        print("privateDataRef->deviceName: ", toStream: &stderr)
-        CFShow(privateDataRef.memory.deviceName)
-        print("privateDataRef->locationID: 0x\(privateDataRef.memory.locationID).\n", toStream: &stderr)
+        print("privateDataRef->deviceName: ", to: &stderr)
+        CFShow(privateDataRef.pointee.deviceName as CFString?)
+        print("privateDataRef->locationID: 0x\(privateDataRef.pointee.locationID).\n", to: &stderr)
         
         // Free the data we're no longer using now that the device is going away
         
-        if privateDataRef.memory.deviceInterface != nil {
-            _ = privateDataRef.memory.deviceInterface.memory.memory.Release(privateDataRef.memory.deviceInterface)
+        if let deviceInterfacePtr = privateDataRef.pointee.deviceInterface {
+            _ = deviceInterfacePtr.pointee.pointee.Release(deviceInterfacePtr)
         }
         
-        _ = IOObjectRelease(privateDataRef.memory.notification)
+        _ = IOObjectRelease(privateDataRef.pointee.notification)
         
-        privateDataRef.dealloc(1)
+        privateDataRef.deinitialize()
+        privateDataRef.deallocate(capacity: 1)
     }
 }
 
@@ -181,37 +183,39 @@ func DeviceNotification(refCon: UnsafeMutablePointer<Void>, service: io_service_
 //	    this interest notification, we can grab the refCon and access our private data.
 //
 //================================================================================================
-func DeviceAdded(refCon: UnsafeMutablePointer<Void>, _ iterator: io_iterator_t) {
+func DeviceAdded(_ refCon: UnsafeMutableRawPointer?, _ iterator: io_iterator_t) {
     var kr: kern_return_t = 0
-    var plugInInterface: UnsafeMutablePointer<UnsafeMutablePointer<IOCFPlugInInterface>> = nil
+    var plugInInterface: UnsafeMutablePointer<UnsafeMutablePointer<IOCFPlugInInterface>?>? = nil
     var score: Int32 = 0
     var res: HRESULT = 0
     
-    while case let usbDevice = IOIteratorNext(iterator) where usbDevice != 0 {
-        let deviceNamePtr = UnsafeMutablePointer<io_name_t>.alloc(1)
-        defer {deviceNamePtr.dealloc(1)}
+    while case let usbDevice = IOIteratorNext(iterator), usbDevice != 0 {
+        var deviceNamePtr = UnsafeMutablePointer<CChar>.allocate(capacity: MemoryLayout<io_name_t>.size)
+        defer {deviceNamePtr.deallocate(capacity: MemoryLayout<io_name_t>.size)}
+        deviceNamePtr.initialize(to: 0, count: MemoryLayout<io_name_t>.size)
+        defer {deviceNamePtr.deinitialize(count: MemoryLayout<io_name_t>.size)}
         var locationID: UInt32 = 0
         
         print("Device added.")
         
         // Add some app-specific information about this device.
         // Create a buffer to hold the data.
-        let privateDataRef = UnsafeMutablePointer<MyPrivateData>.alloc(1)
-        bzero(privateDataRef, sizeof(MyPrivateData))
+        let privateDataRef = UnsafeMutablePointer<MyPrivateData>.allocate(capacity: 1)
+        privateDataRef.initialize(to: MyPrivateData())
         
         // Get the USB device's name.
-        kr = IORegistryEntryGetName(usbDevice, UnsafeMutablePointer(deviceNamePtr))
+        kr = IORegistryEntryGetName(usbDevice, deviceNamePtr)
         if kr != KERN_SUCCESS {
-            deviceNamePtr.memory.0 = 0
+            deviceNamePtr[0] = 0
         }
         
-        let deviceNameAsString = String.fromCString(UnsafePointer(deviceNamePtr))
+        let deviceNameAsString = String(cString: deviceNamePtr)
         
         // Dump our data to stderr just to see what it looks like.
-        print("deviceName: \(deviceNameAsString)", toStream: &stderr)
+        print("deviceName: \(deviceNameAsString)", to: &stderr)
         
         // Save the device's name to our private data.
-        privateDataRef.memory.deviceName = deviceNameAsString
+        privateDataRef.pointee.deviceName = deviceNameAsString
         
         // Now, get the locationID of this device. In order to do this, we need to create an IOUSBDeviceInterface
         // for our device. This will create the necessary connections between our userland application and the
@@ -220,22 +224,25 @@ func DeviceAdded(refCon: UnsafeMutablePointer<Void>, _ iterator: io_iterator_t) 
             &plugInInterface, &score)
         
         if kr != kIOReturnSuccess || plugInInterface == nil {
-            print("IOCreatePlugInInterfaceForService returned 0x\(String(format: "%08x", kr)).", toStream: &stderr)
+            print("IOCreatePlugInInterfaceForService returned 0x\(String(format: "%08x", kr)).", to: &stderr)
             continue
         }
         
         // Use the plugin interface to retrieve the device interface.
-        res = withUnsafeMutablePointer(&privateDataRef.memory.deviceInterface) {deviceInterfacePtr in
-            plugInInterface.memory.memory.QueryInterface(plugInInterface,
-                CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID),
-                UnsafeMutablePointer(deviceInterfacePtr))
-        }
+        res = withUnsafeMutablePointer(to: &privateDataRef.pointee.deviceInterface) {deviceInterfacePtr in
+            deviceInterfacePtr.withMemoryRebound(to: (LPVOID?).self, capacity: 1) {ptr in
+                plugInInterface?.pointee?.pointee.QueryInterface(
+                    plugInInterface,
+                    CFUUIDGetUUIDBytes(kIOUSBDeviceInterfaceID),
+                    ptr)
+            }
+        }!
         
         // Now done with the plugin interface.
-        plugInInterface.memory.memory.Release(plugInInterface)
+        _ = plugInInterface?.pointee?.pointee.Release(plugInInterface)
         
-        if res != 0 || privateDataRef.memory.deviceInterface == nil {
-            print("QueryInterface returned \(res).", toStream: &stderr)
+        if res != 0 || privateDataRef.pointee.deviceInterface == nil {
+            print("QueryInterface returned \(res).", to: &stderr)
             continue
         }
         
@@ -243,15 +250,15 @@ func DeviceAdded(refCon: UnsafeMutablePointer<Void>, _ iterator: io_iterator_t) 
         // In this case, fetch the locationID. The locationID uniquely identifies the device
         // and will remain the same, even across reboots, so long as the bus topology doesn't change.
         
-        kr = privateDataRef.memory.deviceInterface.memory.memory.GetLocationID(privateDataRef.memory.deviceInterface, &locationID)
+        kr = (privateDataRef.pointee.deviceInterface?.pointee.pointee.GetLocationID(privateDataRef.pointee.deviceInterface, &locationID))!
         if kr != KERN_SUCCESS {
-            print("GetLocationID returned 0x\(String(format: "%08x", kr)).", toStream: &stderr)
+            print("GetLocationID returned 0x\(String(format: "%08x", kr)).", to: &stderr)
             continue
         } else {
-            print("Location ID: 0x\(locationID)\n",  toStream: &stderr)
+            print("Location ID: 0x\(locationID)\n",  to: &stderr)
         }
         
-        privateDataRef.memory.locationID = locationID
+        privateDataRef.pointee.locationID = locationID
         
         // Register for an interest notification of this device being removed. Use a reference to our
         // private data as the refCon which will be passed to the notification callback.
@@ -260,7 +267,7 @@ func DeviceAdded(refCon: UnsafeMutablePointer<Void>, _ iterator: io_iterator_t) 
             kIOGeneralInterest,				// interestType
             DeviceNotification,				// callback
             privateDataRef,					// refCon
-            &privateDataRef.memory.notification)	// notification
+            &privateDataRef.pointee.notification)	// notification
         
         if kr != KERN_SUCCESS {
             print("IOServiceAddInterestNotification returned 0x\(String(format: "%08x", kr)).")
@@ -279,8 +286,8 @@ func DeviceAdded(refCon: UnsafeMutablePointer<Void>, _ iterator: io_iterator_t) 
 //	command line).
 //
 //================================================================================================
-func SignalHandler(sigraised: Int32) {
-    print("\nInterrupted.", toStream: &stderr)
+func SignalHandler(_ sigraised: Int32) {
+    print("\nInterrupted.", to: &stderr)
     
     exit(0)
 }
@@ -288,7 +295,7 @@ func SignalHandler(sigraised: Int32) {
 //================================================================================================
 //	main
 //================================================================================================
-func main(args: [String]) -> Int32 {
+func main(_ args: [String]) -> Int32 {
     var usbVendor = kMyVendorID
     var usbProduct = kMyProductID
     
@@ -296,18 +303,18 @@ func main(args: [String]) -> Int32 {
     if args.count > 1 {
         usbVendor = atol(args[1])
     }
-    if Process.arguments.count > 2 {
+    if CommandLine.arguments.count > 2 {
         usbProduct = atol(args[2])
     }
     
     // Set up a signal handler so we can clean up when we're interrupted from the command line
     // Otherwise we stay in our run loop forever.
     let oldHandler: sig_t! = signal(SIGINT, SignalHandler)
-    if unsafeBitCast(oldHandler, Int.self) == unsafeBitCast(SIG_ERR, Int.self) {
-        print("Could not establish new signal handler.", toStream: &stderr)
+    if unsafeBitCast(oldHandler, to: Int.self) == unsafeBitCast(SIG_ERR, to: Int.self) {
+        print("Could not establish new signal handler.", to: &stderr)
     }
     
-    print("Looking for devices matching vendor ID=\(usbVendor) and product ID=\(usbProduct).", toStream: &stderr)
+    print("Looking for devices matching vendor ID=\(usbVendor) and product ID=\(usbProduct).", to: &stderr)
     
     // Set up the matching criteria for the devices we're interested in. The matching criteria needs to follow
     // the same rules as kernel drivers: mainly it needs to follow the USB Common Class Specification, pp. 6-7.
@@ -317,10 +324,10 @@ func main(args: [String]) -> Int32 {
     // criteria to it and it will match every IOUSBDevice in the system. IOServiceAddMatchingNotification will
     // consume this dictionary reference, so there is no need to release it later on.
     
-    var matchingDict = IOServiceMatching(kIOUSBDeviceClassName) as [NSObject: AnyObject]!	// Interested in instances of class
+    guard var matchingDict = IOServiceMatching(kIOUSBDeviceClassName) as CFDictionary? as? [String: Any]	// Interested in instances of class
     // IOUSBDevice and its subclasses
-    if matchingDict == nil {
-        print("IOServiceMatching returned NULL.", toStream: &stderr)
+    else {
+        print("IOServiceMatching returned NULL.", to: &stderr)
         return -1
     }
     
@@ -343,12 +350,12 @@ func main(args: [String]) -> Int32 {
     let runLoopSource = IONotificationPortGetRunLoopSource(gNotifyPort).takeUnretainedValue()
     
     gRunLoop = CFRunLoopGetCurrent()
-    CFRunLoopAddSource(gRunLoop, runLoopSource, kCFRunLoopDefaultMode)
+    CFRunLoopAddSource(gRunLoop, runLoopSource, CFRunLoopMode.defaultMode)
     
     // Now set up a notification to be called when a device is first matched by I/O Kit.
     let _ = IOServiceAddMatchingNotification(gNotifyPort,					// notifyPort
         kIOFirstMatchNotification,	// notificationType
-        matchingDict,					// matching
+        matchingDict as CFDictionary,					// matching
         DeviceAdded,					// callback
         nil,							// refCon
         &gAddedIter					// notification
@@ -358,14 +365,14 @@ func main(args: [String]) -> Int32 {
     DeviceAdded(nil, gAddedIter)
     
     // Start the run loop. Now we'll receive notifications.
-    print("Starting run loop.\n", toStream: &stderr)
+    print("Starting run loop.\n", to: &stderr)
     CFRunLoopRun()
     
     // We should never get here
-    print("Unexpectedly back from CFRunLoopRun()!", toStream: &stderr)
+    print("Unexpectedly back from CFRunLoopRun()!", to: &stderr)
     return 0
 }
 
-let ret = main(Process.arguments)
+let ret = main(CommandLine.arguments)
 exit(ret)
 
