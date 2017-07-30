@@ -324,7 +324,7 @@ func main(_ args: [String]) -> Int32 {
     // criteria to it and it will match every IOUSBDevice in the system. IOServiceAddMatchingNotification will
     // consume this dictionary reference, so there is no need to release it later on.
     
-    guard var matchingDict = IOServiceMatching(kIOUSBDeviceClassName) as CFDictionary? as? [String: Any]	// Interested in instances of class
+    guard var matchingDict = IOServiceMatching(kIOUSBDeviceClassName) as? [String: Any]	// Interested in instances of class
     // IOUSBDevice and its subclasses
     else {
         print("IOServiceMatching returned NULL.", to: &stderr)
